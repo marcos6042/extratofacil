@@ -340,10 +340,12 @@ function showStatus(msg,kind){const s=$("#status");s.hidden=false;s.className="s
 function suggest(r){if(r.cat)return;for(const[re,t,c]of RULES){if(re.test(r.desc)&&tipoOf(r)===t&&(PREFS.cats[t]||[]).includes(c)){r.cat=c;return}}}
 const rowKey=r=>r.fitid?("F"+r.conta+"|"+r.fitid):(r.conta+"|"+r.data+"|"+Number(r.valor).toFixed(2)+"|"+normKey(r.desc));
 function addRows(list){
-  const keys=new Set(S.rows.map(rowKey));let add=0,dup=0;
+  // repetido = já existia antes desta importação (lançamentos iguais no mesmo dia dentro do mesmo extrato são mantidos)
+  const have={};for(const r of S.rows){const k=rowKey(r);have[k]=(have[k]||0)+1}
+  let add=0,dup=0;
   for(const r of list){
     if(!r.data||!isFinite(r.valor)||r.valor===0)continue;
-    const k=rowKey(r);if(keys.has(k)){dup++;continue}keys.add(k);
+    const k=rowKey(r);if(have[k]>0){have[k]--;dup++;continue}
     const row=Object.assign({id:uid(),nota:"",numNota:"",cat:"",nome:"",obs:""},r);suggest(row);S.rows.push(row);add++;
   }
   if(!S.empresa.competencia&&S.rows.length){const d=S.rows.map(r=>r.data).sort();S.empresa.competencia=d[d.length-1].slice(0,7);$("#emp-comp").value=S.empresa.competencia}
@@ -393,17 +395,7 @@ function parseOFX(text){
 /* PDF */
 function loadScript(src){return new Promise((ok,err)=>{const s=document.createElement("script");s.src=src;s.onload=ok;s.onerror=()=>err(new Error("Falha ao carregar "+src));document.head.appendChild(s)})}
 let pdfReady=null;
-function loadPdfJs(){
-  if(!pdfReady)pdfReady=(async()=>{
-    if(!window.pdfjsLib)await loadScript(new URL("assets/lib/pdf.min.js",document.baseURI).href);
-    if(!window.pdfjsLib?.getDocument)throw new Error("Biblioteca PDF indisponível. Atualize a página com Ctrl+F5.");
-    const embedded=document.getElementById("pdf-worker-source");
-    window.pdfjsLib.GlobalWorkerOptions.workerSrc=embedded
-      ? URL.createObjectURL(new Blob([embedded.textContent],{type:"text/javascript"}))
-      : new URL("assets/lib/pdf.worker.min.js",document.baseURI).href;
-  })().catch(error=>{pdfReady=null;throw error});
-  return pdfReady;
-}
+function loadPdfJs(){if(!pdfReady)pdfReady=(async()=>{await loadScript("assets/lib/pdf.min.js");await loadScript("assets/lib/pdf.worker.min.js")})();return pdfReady}
 async function pdfLines(file){
   await loadPdfJs();
   const pdf=await window.pdfjsLib.getDocument({data:new Uint8Array(await file.arrayBuffer()),isEvalSupported:false}).promise;
@@ -419,25 +411,37 @@ async function pdfLines(file){
 const MONEY=/(^|\s)([-+])?\s?(?:R\$\s?)?(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})(?:\s?([-+]|[DC])(?=\s|$|\*))?/g;
 const DEB=/\b(PAG|PGTO|PAGTO|PAGAMENTO|DEB|D[EÉ]BITO|TARIFA|TAR|SAQUE|ENVIAD[OA]?|ENVIO|COMPRA|IOF|JUROS|APLIC|EMITID[OA])/i;
 const CRED=/\b(RECEB|RECEBID[OA]|CRED|CR[EÉ]DITO|DEP[OÓ]SITO|RESGATE|RENDIMENTO|ESTORNO|DEVOLU)/i;
+const MESES={janeiro:1,fevereiro:2,"março":3,marco:3,abril:4,maio:5,junho:6,julho:7,agosto:8,setembro:9,outubro:10,novembro:11,dezembro:12,jan:1,fev:2,mar:3,abr:4,mai:5,jun:6,jul:7,ago:8,set:9,out:10,nov:11,dez:12};
+function lineDate(line,yF){
+  let m=line.match(/^(\d{1,2})[\/.\-](\d{1,2})(?:[\/.\-](\d{2,4}))?(?=\s|$)/);
+  if(m){const d=validISO(m[3]||yF,m[2],m[1]);if(d)return{date:d,len:m[0].length}}
+  m=line.match(/^(\d{1,2})\s+de\s+([A-Za-zÀ-ÿ]+)\s+de\s+(\d{4})/i)||line.match(/^(\d{1,2})[\s\/\-]+([A-Za-zÀ-ÿ]{3,9})\.?(?:[\s\/\-]+(\d{2,4}))?(?=\s|$)/i);
+  if(m){const mo=MESES[m[2].toLowerCase()];if(mo){const d=validISO(m[3]||yF,mo,m[1]);if(d)return{date:d,len:m[0].length}}}
+  return null;
+}
+function moneyTokens(line){const vals=[];let m;MONEY.lastIndex=0;while((m=MONEY.exec(line)))vals.push({sign:m[2]||"",num:m[3],suf:m[4]||"",raw:m[0]});return vals}
+function pdfConta(all){
+  const flat=all.replace(/\s+/g," ");
+  const ag=flat.match(/Ag[êe]ncia\s*:?\s*([\d][\d.\-]*)/i),cc=flat.match(/Conta(?:\s+Corrente)?\s*:?\s*([\d][\d.\-]{3,})/i);
+  if(!cc)return null;
+  let banco="";const up=flat.toUpperCase();
+  for(const n of Object.values(BANCOS)){if(up.includes(n.toUpperCase())){banco=n;break}}
+  return{nome:[banco||"Banco",ag?"ag. "+ag[1]:"","c/c "+cc[1]].filter(Boolean).join(" · "),chave:"pdf|"+digits(cc[1])};
+}
 async function parsePDF(file){
   const texts=await pdfLines(file);const all=texts.join("\n");
   if(all.replace(/\s/g,"").length<30)throw new Error("Este PDF não tem texto legível (provavelmente é uma imagem escaneada). Peça ao banco o extrato em OFX ou Excel.");
-  const ym=all.match(/\b\d{2}\/\d{2}\/(20\d{2})\b/);const yF=ym?+ym[1]:fallbackYear();
-  const out=[];let lastDate="",pendDesc="",dataPorExtenso=false;
-  const meses={janeiro:1,fevereiro:2,marco:3,abril:4,maio:5,junho:6,julho:7,agosto:8,setembro:9,outubro:10,novembro:11,dezembro:12};
+  const ym=all.match(/\b\d{2}\/\d{2}\/(20\d{2})\b/)||all.match(/\bde\s+(20\d{2})\b/);const yF=ym?+ym[1]:fallbackYear();
+  // Como o banco indica saída? Sinal de menos (ex.: -R$ 200,00) ou letras D/C.
+  let minus=0,dc=0;for(const t of texts)for(const v of moneyTokens(t)){if(v.sign==="-"||v.suf==="-")minus++;if(/^[DC]$/i.test(v.suf))dc++}
+  const unsignedIsCredit=minus>0&&dc===0;
+  const out=[];let lastDate="",pendDesc="";
   for(const raw of texts){
-    let line=raw.trim();
-    // Inter: a data aparece no cabeçalho do dia, não em cada lançamento.
-    const extenso=line.normalize("NFD").replace(/[\u0300-\u036f]/g,"").match(/^(\d{1,2})\s+de\s+([a-z]+)\s+de\s+(20\d{2})(?=\s|$)/i);
-    if(extenso&&meses[extenso[2].toLowerCase()]){
-      dataPorExtenso=true;lastDate=validISO(extenso[3],meses[extenso[2].toLowerCase()],extenso[1]);
-      pendDesc="";continue;
-    }
-    const dm=line.match(/^(\d{1,2})[\/.\-](\d{1,2})(?:[\/.\-](\d{2,4}))?(?=\s|$)/);let date="";
-    if(dm){date=validISO(dm[3]||yF,dm[2],dm[1]);if(date)line=line.slice(dm[0].length).trim()}
-    const vals=[];let m;MONEY.lastIndex=0;while((m=MONEY.exec(line)))vals.push({sign:m[2]||"",num:m[3],suf:m[4]||"",raw:m[0]});
+    let line=raw.trim();let date="";
+    const ld=lineDate(line,yF);if(ld){date=ld.date;line=line.slice(ld.len).trim()}
+    const vals=moneyTokens(line);
     let desc=line;for(const v of vals)desc=desc.replace(v.raw.trim(),"");
-    desc=desc.replace(/\s{2,}/g," ").replace(/^[\s\-|*]+|[\s\-|*]+$/g,"").trim();
+    desc=desc.replace(/["“”]/g,"").replace(/\s{2,}/g," ").replace(/^[\s\-|*:]+|[\s\-|*:]+$/g,"").trim();
     if(date&&!vals.length){lastDate=date;pendDesc=desc;continue}
     if(!vals.length)continue;
     if(!date){if(!lastDate)continue;date=lastDate}else lastDate=date;
@@ -445,11 +449,10 @@ async function parsePDF(file){
     if(!desc||/saldo|s\s*a\s*l\s*d\s*o|total|limite/i.test(desc))continue;
     const v=vals[0];const n=parseNum(v.num);let sign=0;
     if(v.sign==="-"||v.suf==="-"||/^D$/i.test(v.suf))sign=-1;else if(v.sign==="+"||v.suf==="+"||/^C$/i.test(v.suf))sign=1;
-    if(!sign&&dataPorExtenso&&/R\$/.test(v.raw))sign=1;
-    if(!sign)sign=DEB.test(desc)?-1:CRED.test(desc)?1:-1;
+    if(!sign)sign=unsignedIsCredit?1:DEB.test(desc)?-1:CRED.test(desc)?1:-1;
     out.push({data:date,valor:sign*Math.abs(n),desc});
   }
-  if(!out.length)throw new Error("O PDF contém texto, mas o formato dos lançamentos não foi reconhecido. Envie o extrato em CSV ou OFX, ou solicite suporte para este modelo de PDF.");
+  out.conta=pdfConta(all);
   return out;
 }
 
@@ -470,7 +473,7 @@ async function parseSheet(file){
   const heads=[];for(let c=0;c<width;c++){const h=hi>=0?String(aoa[hi][c]??"").trim():"";heads.push(h||("Coluna "+XLSX.utils.encode_col(c)))}
   const data=aoa.slice(hi+1);
   const pick=re=>{const i=heads.findIndex(h=>re.test(h));return i<0?"":String(i)};
-  const sel={data:pick(KW.data),desc:String(heads.findIndex(h=>KW.desc.test(h)&&!KW.data.test(h))).replace(/^-1$/, ""),valor:pick(KW.valor),deb:pick(KW.deb),cred:pick(KW.cred),dc:pick(KW.dc)};
+  const sel={data:pick(KW.data),desc:pick(KW.desc),valor:pick(KW.valor),deb:pick(KW.deb),cred:pick(KW.cred),dc:pick(KW.dc)};
   if(sel.valor!==""){sel.deb="";sel.cred=""}
   if(sel.data===""){for(let c=0;c<width;c++){if(data.slice(0,8).filter(r=>parseDate(r[c],2000)).length>=3){sel.data=String(c);break}}}
   mapCtx={heads,data,file:file.name};
@@ -495,14 +498,7 @@ $("#map-ok").addEventListener("click",()=>{
       if(isFinite(cr)&&cr!==0)valor=Math.abs(cr);else if(isFinite(d)&&d!==0)valor=-Math.abs(d);else continue}
     if(!isFinite(valor))continue;
     if(c.dc>=0){const n=String(r[c.dc]).trim().toUpperCase();if(n.startsWith("D"))valor=-Math.abs(valor);else if(n.startsWith("C"))valor=Math.abs(valor)}
-    let desc=c.desc>=0?String(r[c.desc]).trim():"";
-    // CSV do Inter separa o tipo da operação e o favorecido em duas colunas.
-    const hi=mapCtx.heads.findIndex(h=>/^hist[oó]rico$/i.test(h));
-    const di=mapCtx.heads.findIndex(h=>/^descri[cç][aã]o$/i.test(h));
-    if(hi>=0&&di>=0&&(c.desc===hi||c.desc===di)){
-      desc=[...new Set([r[hi],r[di]].map(v=>String(v??"").trim()).filter(Boolean))].join(" · ");
-    }
-    if(/saldo/i.test(desc))continue;
+    const desc=c.desc>=0?String(r[c.desc]).trim():"";if(/saldo/i.test(desc))continue;
     out.push({data,valor:Math.round(valor*100)/100,desc:desc||"(sem descrição)"});
   }
   $("#map").hidden=true;const done=mapCtx.done;mapCtx=null;done(out);
@@ -535,7 +531,8 @@ async function handleFiles(files){
     try{
       let list,note="";
       if(ext==="ofx"||ext==="qfx"){const o=parseOFX(await readText(f));let c=S.contas.find(x=>x.chave&&x.chave===o.conta.chave);if(!c)c=addConta(o.conta.nome,o.conta.chave);o.rows.forEach(r=>r.conta=c.id);list=o.rows;note=` Conta: ${esc(c.nome)}.`}
-      else if(ext==="pdf"){showStatus(`Lendo ${esc(f.name)}…`);list=await parsePDF(f);const cid=importConta();list.forEach(r=>r.conta=cid);note=` Conta: ${esc(contaNome(cid))}. Leitura de PDF: confira datas, valores e se cada lançamento é pagamento ou recebimento (clique na etiqueta para inverter).`}
+      else if(ext==="pdf"){showStatus(`Lendo ${esc(f.name)}…`);list=await parsePDF(f);let cid;
+        if(list.conta){let c=S.contas.find(x=>x.chave===list.conta.chave);if(!c)c=addConta(list.conta.nome,list.conta.chave);cid=c.id}else cid=importConta();list.forEach(r=>r.conta=cid);note=` Conta: ${esc(contaNome(cid))}. Leitura de PDF: confira datas, valores e se cada lançamento é pagamento ou recebimento (clique na etiqueta para inverter).`}
       else if(["xlsx","xls","xlsm","ods","csv","txt"].includes(ext)){list=await parseSheet(f);if(!list)continue;
         if(list.restored)note=" Classificação anterior restaurada.";else{const cid=importConta();list.forEach(r=>r.conta=cid);note=` Conta: ${esc(contaNome(cid))}.`}}
       else{showStatus(`Formato não reconhecido: ${esc(f.name)}. Use OFX, Excel, CSV ou PDF.`,"warn");continue}
