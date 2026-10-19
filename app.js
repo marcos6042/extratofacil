@@ -394,7 +394,13 @@ function parseOFX(text){
 
 /* PDF */
 function loadScript(src){return new Promise((ok,err)=>{const s=document.createElement("script");s.src=src;s.onload=ok;s.onerror=()=>err(new Error("Falha ao carregar "+src));document.head.appendChild(s)})}
-let pdfReady=null;
+let pdfReady=null,xlsxReady=null;
+function ensureXLSX(){
+  if(window.XLSX)return Promise.resolve();
+  if(!xlsxReady)xlsxReady=(async()=>{for(const u of["https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js","https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"]){try{await loadScript(u);if(window.XLSX)return}catch(e){}}
+    xlsxReady=null;throw new Error("não foi possível carregar o leitor de planilhas. Verifique a internet e recarregue a página (Ctrl+F5).")})();
+  return xlsxReady;
+}
 const PDF_SRC=[["https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js","https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"],
   ["https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js","https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js"],
   ["assets/lib/pdf.min.js","assets/lib/pdf.worker.min.js"]];
@@ -407,6 +413,7 @@ function loadPdfJs(){
   })();
   return pdfReady;
 }
+let lastPdfRaw=null;
 async function pdfLines(file){
   await loadPdfJs();
   const pdf=await window.pdfjsLib.getDocument({data:new Uint8Array(await file.arrayBuffer()),isEvalSupported:false}).promise;
@@ -415,9 +422,49 @@ async function pdfLines(file){
     const tc=await (await pdf.getPage(p)).getTextContent();
     const items=tc.items.filter(i=>i.str&&i.str.trim()).map(i=>({x:i.transform[4],y:i.transform[5],w:i.width,s:i.str}));
     items.sort((a,b)=>b.y-a.y||a.x-b.x);let cur=null;
-    for(const it of items){if(!cur||Math.abs(cur.y-it.y)>3){cur={y:it.y,items:[]};lines.push(cur)}cur.items.push(it)}
+    for(const it of items){if(!cur||Math.abs(cur.y-it.y)>3){cur={page:p,y:it.y,items:[]};lines.push(cur)}cur.items.push(it)}
   }
-  return lines.map(l=>{l.items.sort((a,b)=>a.x-b.x);let t="",end=null;for(const it of l.items){if(end!==null&&it.x-end>1)t+=it.x-end>12?"   ":" ";t+=it.s;end=it.x+it.w}return t.replace(/\s+$/,"")});
+  for(const l of lines){l.items.sort((a,b)=>a.x-b.x);let t="",end=null;for(const it of l.items){if(end!==null&&it.x-end>1)t+=it.x-end>12?"   ":" ";t+=it.s;end=it.x+it.w}l.text=t.replace(/\s+$/,"")}
+  lastPdfRaw=lines;
+  return lines.map(l=>l.text);
+}
+/* Extratos em colunas com valor "1.234,56 (+)" / "(-)" e histórico em várias linhas (ex.: Banco do Brasil).
+   Cada lançamento é ancorado na linha do valor; as linhas do histórico vão para o valor mais próximo. */
+function parseColumnsPDF(raw,yF){
+  const VAL=/(\d{1,3}(?:\.\d{3})*,\d{2})\s*\(\s*([+-])\s*\)/;
+  if(raw.filter(l=>VAL.test(l.text)).length<3)return null;
+  const hdr=raw.find(l=>/Hist[oó]rico/i.test(l.text)&&/Valor/i.test(l.text));
+  const histX=hdr?(hdr.items.find(i=>/Hist[oó]rico/i.test(i.s))||{x:0}).x-6:0;
+  const out=[];
+  const pages=[...new Set(raw.map(l=>l.page))];
+  for(const pg of pages){
+    const L=raw.filter(l=>l.page===pg);
+    const ph=L.find(l=>/Hist[oó]rico/i.test(l.text)&&/Valor/i.test(l.text));
+    const topY=ph?ph.y:Infinity;
+    const body=L.filter(l=>l.y<topY-2);
+    const anchors=body.filter(l=>VAL.test(l.text)).map(l=>({l,y:l.y,parts:[],date:""}));
+    if(!anchors.length)continue;
+    const near=y=>{let b=null,d=1e9;for(const a of anchors){const k=Math.abs(a.y-y);if(k<d){d=k;b=a}}return d<=13?b:null};
+    for(const l of body){
+      const a=near(l.y);if(!a)continue;
+      for(const it of l.items){
+        const t=it.s.trim();if(!t)continue;
+        const dm=t.match(/^(\d{2})\/(\d{2})\/(\d{2,4})$/);
+        if(dm&&it.x<histX){if(l.y>=a.y-1&&!a.date)a.date=dm[0];continue}
+        if(VAL.test(t)&&l===a.l)continue;
+        if(it.x>=histX)a.parts.push({y:l.y,x:it.x,t:t.replace(VAL,"").trim()});
+      }
+    }
+    for(const a of anchors){
+      const m=a.l.text.match(VAL);
+      if(!a.date){const above=body.filter(l=>l.y>a.y&&l.y-a.y<13&&/^\d{2}\/\d{2}\/\d{2,4}/.test(l.text.trim()));if(above.length)a.date=above[0].text.trim().split(/\s/)[0]}
+      const dd=(a.date||"").match(/(\d{2})\/(\d{2})\/(\d{2,4})/);const data=dd?validISO(dd[3].length===4?dd[3]:yF,dd[2],dd[1]):"";
+      const desc=a.parts.sort((p,q)=>q.y-p.y||p.x-q.x).map(p=>p.t).filter(Boolean).join(" - ").replace(/\s{2,}/g," ").trim();
+      if(!data||!desc||/^\s*(saldo|s\s*a\s*l\s*d\s*o)\b|\bsaldo\s+(anterior|do\s+dia|final|atual|dispon[ií]vel|bloqueado|total)\b/i.test(desc))continue;
+      out.push({data,valor:(m[2]==="-"?-1:1)*parseNum(m[1]),desc});
+    }
+  }
+  return out;
 }
 const MONEY=/(^|\s)([-+])?\s?(?:R\$\s?)?(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})(?:\s?([-+]|[DC])(?=\s|$|\*))?/g;
 const DEB=/\b(PAG|PGTO|PAGTO|PAGAMENTO|DEB|D[EÉ]BITO|TARIFA|TAR|SAQUE|ENVIAD[OA]?|ENVIO|COMPRA|IOF|JUROS|APLIC|EMITID[OA])/i;
@@ -431,18 +478,22 @@ function lineDate(line,yF){
   return null;
 }
 function moneyTokens(line){const vals=[];let m;MONEY.lastIndex=0;while((m=MONEY.exec(line)))vals.push({sign:m[2]||"",num:m[3],suf:m[4]||"",raw:m[0]});return vals}
+function docCnpj(all){const m=all.match(/\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/g);return m?[...new Set(m.map(digits))]:[]}
 function pdfConta(all){
   const flat=all.replace(/\s+/g," ");
   const ag=flat.match(/Ag[êe]ncia\s*:?\s*([\d][\d.\-]*)/i),cc=flat.match(/Conta(?:\s+Corrente)?\s*:?\s*([\d][\d.\-]{3,})/i);
   if(!cc)return null;
   let banco="";const up=flat.toUpperCase();
-  for(const n of Object.values(BANCOS)){if(up.includes(n.toUpperCase())){banco=n;break}}
+  if(/BANCO DO BRASIL|\bBB (RENDE|GIRO|SEGURO|CONS[OÓ]RCIO|CR[EÉ]DITO)|OUROCARD/.test(up))banco="Banco do Brasil";
+  else{let best=0;for(const n of Object.values(BANCOS)){const k=(up.match(new RegExp("(^|[^A-Z0-9])"+n.toUpperCase().replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+"(?![A-Z0-9])","g"))||[]).length;if(k>best){best=k;banco=n}}}
   return{nome:[banco||"Banco",ag?"ag. "+ag[1]:"","c/c "+cc[1]].filter(Boolean).join(" · "),chave:"pdf|"+digits(cc[1])};
 }
 async function parsePDF(file){
   const texts=await pdfLines(file);const all=texts.join("\n");
   if(all.replace(/\s/g,"").length<30)throw new Error("Este PDF não tem texto legível (provavelmente é uma imagem escaneada). Peça ao banco o extrato em OFX ou Excel.");
   const ym=all.match(/\b\d{2}\/\d{2}\/(20\d{2})\b/)||all.match(/\bde\s+(20\d{2})\b/);const yF=ym?+ym[1]:fallbackYear();
+  const cols=parseColumnsPDF(lastPdfRaw||[],yF);
+  if(cols&&cols.length){cols.conta=pdfConta(all);cols.cnpjDoc=docCnpj(all);return cols}
   // Como o banco indica saída? Sinal de menos (ex.: -R$ 200,00) ou letras D/C.
   let minus=0,dc=0;for(const t of texts)for(const v of moneyTokens(t)){if(v.sign==="-"||v.suf==="-")minus++;if(/^[DC]$/i.test(v.suf))dc++}
   const unsignedIsCredit=minus>0&&dc===0;
@@ -457,13 +508,13 @@ async function parsePDF(file){
     if(!vals.length)continue;
     if(!date){if(!lastDate)continue;date=lastDate}else lastDate=date;
     if(!desc&&pendDesc)desc=pendDesc;pendDesc="";
-    if(!desc||/saldo|s\s*a\s*l\s*d\s*o|total|limite/i.test(desc))continue;
+    if(!desc||/^\s*(saldo|s\s*a\s*l\s*d\s*o)\b|\bsaldo\s+(anterior|do\s+dia|final|atual|dispon[ií]vel|bloqueado|total)\b/i.test(desc)||/^\s*(total|limite)\b/i.test(desc))continue;
     const v=vals[0];const n=parseNum(v.num);let sign=0;
     if(v.sign==="-"||v.suf==="-"||/^D$/i.test(v.suf))sign=-1;else if(v.sign==="+"||v.suf==="+"||/^C$/i.test(v.suf))sign=1;
     if(!sign)sign=unsignedIsCredit?1:DEB.test(desc)?-1:CRED.test(desc)?1:-1;
     out.push({data:date,valor:sign*Math.abs(n),desc});
   }
-  out.conta=pdfConta(all);
+  out.conta=pdfConta(all);out.cnpjDoc=docCnpj(all);
   return out;
 }
 
@@ -471,6 +522,7 @@ async function parsePDF(file){
 let mapCtx=null;
 const KW={data:/^(data|dt\.?|date)\b|data\s+(do\s+)?(lan|mov)/i,desc:/hist[oó]rico|descri|lan[cç]amento|memo|detalhe|estabelec/i,valor:/^valor(\s*\(r\$\))?$|^valor\s+(do\s+)?lan|montante|quantia|^amount$/i,deb:/d[eé]bito|sa[ií]da/i,cred:/cr[eé]dito|entrada/i,dc:/^(d\/c|c\/d|natureza|tipo)$/i};
 async function parseSheet(file){
+  await ensureXLSX();
   const ext=file.name.split(".").pop().toLowerCase();let wb;
   if(ext==="csv"||ext==="txt"){const text=await readText(file);const first=text.split(/\r?\n/).slice(0,10).join("\n");const cnt=c=>first.split(c).length;
     const FS=[";","\t",","].sort((a,b)=>cnt(b)-cnt(a))[0];wb=XLSX.read(text,{type:"string",raw:true,FS})}
@@ -487,7 +539,7 @@ async function parseSheet(file){
   const sel={data:pick(KW.data),desc:pick(KW.desc),valor:pick(KW.valor),deb:pick(KW.deb),cred:pick(KW.cred),dc:pick(KW.dc)};
   if(sel.valor!==""){sel.deb="";sel.cred=""}
   if(sel.data===""){for(let c=0;c<width;c++){if(data.slice(0,8).filter(r=>parseDate(r[c],2000)).length>=3){sel.data=String(c);break}}}
-  mapCtx={heads,data,file:file.name};
+  mapCtx={heads,data,file:file.name,conta:pdfConta(aoa.slice(0,Math.max(hi,0)+1).concat(aoa.slice(0,12)).map(r=>r.join(" ")).join(" "))};
   const opts=`<option value="">(nenhuma)</option>`+heads.map((h,i)=>`<option value="${i}">${esc(h)}</option>`).join("");
   const ids={data:"m-data",desc:"m-desc",valor:"m-valor",deb:"m-deb",cred:"m-cred",dc:"m-dc"};
   for(const k in ids){const s=$("#"+ids[k]);s.innerHTML=opts;s.value=sel[k]}
@@ -512,7 +564,7 @@ $("#map-ok").addEventListener("click",()=>{
     const desc=c.desc>=0?String(r[c.desc]).trim():"";if(/saldo/i.test(desc))continue;
     out.push({data,valor:Math.round(valor*100)/100,desc:desc||"(sem descrição)"});
   }
-  $("#map").hidden=true;const done=mapCtx.done;mapCtx=null;done(out);
+  out.conta=mapCtx.conta;$("#map").hidden=true;const done=mapCtx.done;mapCtx=null;done(out);
 });
 function restore(wb,aoa){
   if(wb.Sheets["Empresa"]){
@@ -543,9 +595,11 @@ async function handleFiles(files){
       let list,note="";
       if(ext==="ofx"||ext==="qfx"){const o=parseOFX(await readText(f));let c=S.contas.find(x=>x.chave&&x.chave===o.conta.chave);if(!c)c=addConta(o.conta.nome,o.conta.chave);o.rows.forEach(r=>r.conta=c.id);list=o.rows;note=` Conta: ${esc(c.nome)}.`}
       else if(ext==="pdf"){showStatus(`Lendo ${esc(f.name)}…`);list=await parsePDF(f);let cid;
-        if(list.conta){let c=S.contas.find(x=>x.chave===list.conta.chave);if(!c)c=addConta(list.conta.nome,list.conta.chave);cid=c.id}else cid=importConta();list.forEach(r=>r.conta=cid);note=` Conta: ${esc(contaNome(cid))}. Leitura de PDF: confira datas, valores e se cada lançamento é pagamento ou recebimento (clique na etiqueta para inverter).`}
+        if(list.conta){let c=S.contas.find(x=>x.chave===list.conta.chave);if(!c)c=addConta(list.conta.nome,list.conta.chave);cid=c.id}else cid=importConta();
+        list.forEach(r=>r.conta=cid);note=` Conta: ${esc(contaNome(cid))}. Leitura de PDF: confira datas, valores e se cada lançamento é pagamento ou recebimento (clique na etiqueta para inverter).`;
+        if(LOCKED&&list.cnpjDoc&&list.cnpjDoc.length&&!list.cnpjDoc.includes(digits(S.empresa.cnpj)))note+=" <b>Atenção:</b> o CNPJ que aparece neste extrato não é o desta empresa. Confira se o arquivo é o correto.";}
       else if(["xlsx","xls","xlsm","ods","csv","txt"].includes(ext)){list=await parseSheet(f);if(!list)continue;
-        if(list.restored)note=" Classificação anterior restaurada.";else{const cid=importConta();list.forEach(r=>r.conta=cid);note=` Conta: ${esc(contaNome(cid))}.`}}
+        if(list.restored)note=" Classificação anterior restaurada.";else{let cid;if(list.conta){let c=S.contas.find(x=>x.chave===list.conta.chave);if(!c)c=addConta(list.conta.nome,list.conta.chave);cid=c.id}else cid=importConta();list.forEach(r=>r.conta=cid);note=` Conta: ${esc(contaNome(cid))}.`}}
       else{showStatus(`Formato não reconhecido: ${esc(f.name)}. Use OFX, Excel, CSV ou PDF.`,"warn");continue}
       if(!list.length){showStatus(`Nenhum lançamento encontrado em ${esc(f.name)}.`,"warn");continue}
       const{add,dup}=addRows(list);
@@ -613,7 +667,8 @@ function buildWorkbook(){
   return wb;
 }
 let exportConfirmed=false;
-$("#btn-export").addEventListener("click",()=>{
+$("#btn-export").addEventListener("click",async()=>{
+  try{await ensureXLSX()}catch(e){showExp(esc(e.message),"warn");return}
   if(!S.rows.length){showExp("Não há lançamentos para exportar.","warn");return}
   const pend=S.rows.filter(r=>!isDone(r)).length;
   if(pend&&!exportConfirmed){exportConfirmed=true;showExp(`Ainda há <b>${pend}</b> lançamento${pend>1?"s":""} pendente${pend>1?"s":""} (sem nota, categoria ou nome). Clique em "Baixar planilha Excel" de novo para baixar assim mesmo; os pendentes vão numa aba separada.`,"warn");setTimeout(()=>{exportConfirmed=false},15000);return}
