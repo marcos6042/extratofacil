@@ -395,7 +395,18 @@ function parseOFX(text){
 /* PDF */
 function loadScript(src){return new Promise((ok,err)=>{const s=document.createElement("script");s.src=src;s.onload=ok;s.onerror=()=>err(new Error("Falha ao carregar "+src));document.head.appendChild(s)})}
 let pdfReady=null;
-function loadPdfJs(){if(!pdfReady)pdfReady=(async()=>{await loadScript("assets/lib/pdf.min.js");await loadScript("assets/lib/pdf.worker.min.js")})();return pdfReady}
+const PDF_SRC=[["https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js","https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"],
+  ["https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js","https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js"],
+  ["assets/lib/pdf.min.js","assets/lib/pdf.worker.min.js"]];
+function loadPdfJs(){
+  if(!pdfReady)pdfReady=(async()=>{
+    for(const[lib,worker]of PDF_SRC){
+      try{if(!window.pdfjsLib)await loadScript(lib);if(!window.pdfjsWorker)await loadScript(worker);if(window.pdfjsLib&&window.pdfjsWorker)return}catch(e){console.warn(e.message)}
+    }
+    pdfReady=null;throw new Error("não foi possível carregar o leitor de PDF. Verifique a internet e recarregue a página (Ctrl+F5).");
+  })();
+  return pdfReady;
+}
 async function pdfLines(file){
   await loadPdfJs();
   const pdf=await window.pdfjsLib.getDocument({data:new Uint8Array(await file.arrayBuffer()),isEvalSupported:false}).promise;
