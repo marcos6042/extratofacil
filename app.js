@@ -393,7 +393,17 @@ function parseOFX(text){
 /* PDF */
 function loadScript(src){return new Promise((ok,err)=>{const s=document.createElement("script");s.src=src;s.onload=ok;s.onerror=()=>err(new Error("Falha ao carregar "+src));document.head.appendChild(s)})}
 let pdfReady=null;
-function loadPdfJs(){if(!pdfReady)pdfReady=(async()=>{await loadScript("assets/lib/pdf.min.js");await loadScript("assets/lib/pdf.worker.min.js")})();return pdfReady}
+function loadPdfJs(){
+  if(!pdfReady)pdfReady=(async()=>{
+    if(!window.pdfjsLib)await loadScript(new URL("assets/lib/pdf.min.js",document.baseURI).href);
+    if(!window.pdfjsLib?.getDocument)throw new Error("Biblioteca PDF indisponível. Atualize a página com Ctrl+F5.");
+    const embedded=document.getElementById("pdf-worker-source");
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc=embedded
+      ? URL.createObjectURL(new Blob([embedded.textContent],{type:"text/javascript"}))
+      : new URL("assets/lib/pdf.worker.min.js",document.baseURI).href;
+  })().catch(error=>{pdfReady=null;throw error});
+  return pdfReady;
+}
 async function pdfLines(file){
   await loadPdfJs();
   const pdf=await window.pdfjsLib.getDocument({data:new Uint8Array(await file.arrayBuffer()),isEvalSupported:false}).promise;
